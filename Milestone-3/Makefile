@@ -11,9 +11,10 @@ CC  = $(QCC) -Vgcc_ntoarmv7le
 
 INCLUDES = -I./include -I./src
 # Remove -fPIC and -Bdynamic to produce a true QNX executable (ET_EXEC), not a shared lib (ET_DYN)
-CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -Wc,-std=gnu++0x -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp $(INCLUDES)
+CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -Wc,-std=gnu++0x -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -Wc,-include,cstddef -Wc,-include,cstdint $(INCLUDES)
 # Set RPATH so QNX's dynamic linker automatically finds liba2i_client.so in /opt/mm/lib without copying
-LDFLAGS  = -L./lib -la2i_client -lsocket -lssl -lcrypto -lscreen -lang-c++ -Wl,-rpath,/opt/mm/lib:/lib:/usr/lib
+LDFLAGS  = -L./lib -la2i_client -lsocket ./lib/libssl.so ./lib/libcrypto.so -lscreen -lang-c++ -Wl,-rpath,/opt/mm/lib:/lib:/usr/lib
+
 
 SRCS = src/main.cpp \
        src/audio_manager.cpp \
@@ -29,7 +30,9 @@ SRCS = src/main.cpp \
        src/sdr_builder.cpp \
        src/crash_handler.cpp
 
-OBJS = $(SRCS:.cpp=.o)
+BUILD_DIR = build
+# Object files go into build/ (mirrors src/ basenames), not next to the sources.
+OBJS = $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 TARGET = nbt-aad
 
 .PHONY: all clean
@@ -46,10 +49,14 @@ test_display: test_display.cpp
 	$(CXX) $(CXXFLAGS) -o test_display test_display.cpp -L./lib -lscreen -lang-c++
 	@echo [DONE] Built test_display for QNX armv7le
 
-%.o: %.cpp
+# Compile src/<name>.cpp -> build/<name>.o (order-only dep creates the dir)
+$(BUILD_DIR)/%.o: src/%.cpp | $(BUILD_DIR)
 	@echo [CXX] $<
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
+
 clean:
-	@echo [CLEAN] Removing object files and binaries
-	rm -f $(OBJS) $(TARGET)
+	@echo [CLEAN] Removing build directory and binaries
+	rm -rf $(BUILD_DIR) $(TARGET) test_display

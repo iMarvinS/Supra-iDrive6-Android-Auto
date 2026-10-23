@@ -11,9 +11,15 @@ CC  = $(QCC) -Vgcc_ntoarmv7le
 
 INCLUDES = -I./include -I./src
 # Remove -fPIC and -Bdynamic to produce a true QNX executable (ET_EXEC), not a shared lib (ET_DYN)
-CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -Wc,-std=gnu++0x -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp $(INCLUDES)
+# QNX 6.5 sysroot headers + modern GCC: <stddef.h>/<stdint.h> guards clash so size_t/uintN_t
+# can read as "not declared". Force-include the C++ variants first to inject std::/::size_t.
+CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -Wc,-std=gnu++0x -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -Wc,-include,cstddef -Wc,-include,cstdint $(INCLUDES)
 # Set RPATH so QNX's dynamic linker automatically finds liba2i_client.so in /opt/mm/lib without copying
-LDFLAGS  = -L./lib -la2i_client -lsocket -lssl -lcrypto -lscreen -lang-c++ -Wl,-rpath,/opt/mm/lib:/lib:/usr/lib
+# ssl/crypto exist in BOTH the QNX sysroot (old OpenSSL, no TLSv1_2_*) and ./lib (newer,
+# matching the head unit). The QNX gcc spec searches the sysroot libdir before -L./lib, so
+# -lssl/-lcrypto would wrongly bind the old sysroot copies. Link ours by explicit path; the
+# resulting NEEDED records their SONAMEs (libssl.so.2/libcrypto.so.2) for the device loader.
+LDFLAGS  = -L./lib -la2i_client -lsocket ./lib/libssl.so ./lib/libcrypto.so -lscreen -lang-c++ -Wl,-rpath,/opt/mm/lib:/lib:/usr/lib
 
 SRCS = src/main.cpp \
        src/audio_manager.cpp \
@@ -27,7 +33,9 @@ SRCS = src/main.cpp \
        src/aa_cryptor.cpp \
        src/bluetooth_manager.cpp
 
-OBJS = $(SRCS:.cpp=.o)
+BUILD_DIR = build
+# Object files go into build/ (mirrors src/ basenames), not next to the sources.
+OBJS = $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 TARGET = nbt-aad
 
 .PHONY: all clean
@@ -44,10 +52,14 @@ test_display: test_display.cpp
 	$(CXX) $(CXXFLAGS) -o test_display test_display.cpp -L./lib -lscreen -lang-c++
 	@echo [DONE] Built test_display for QNX armv7le
 
-%.o: %.cpp
+# Compile src/<name>.cpp -> build/<name>.o (order-only dep creates the dir)
+$(BUILD_DIR)/%.o: src/%.cpp | $(BUILD_DIR)
 	@echo [CXX] $<
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
+
 clean:
-	@echo [CLEAN] Removing object files and binaries
-	rm -f $(OBJS) $(TARGET)
+	@echo [CLEAN] Removing build directory and binaries
+	rm -rf $(BUILD_DIR) $(TARGET) test_display
