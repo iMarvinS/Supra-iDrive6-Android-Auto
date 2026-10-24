@@ -65,6 +65,28 @@ public:
         return -1;
     }
 
+    // Variant B (BMW F36 / NBT-Evo inst 0x01, fkt 0xC20): tilt bitmask (d[4]) -> DPAD key.
+    static uint32_t tiltKeyV2(uint8_t b) {
+        switch (b) {
+            case 0x01: return AAK_DPAD_UP;    case 0x02: return AAK_DPAD_RIGHT;
+            case 0x04: return AAK_DPAD_DOWN;  case 0x08: return AAK_DPAD_LEFT;
+            default:   return 0;
+        }
+    }
+    // Variant B hard-key bitmask (d[6]) -> slot index (same slots/keys as variant A).
+    static int keyBitToSlot(uint8_t b) {
+        switch (b) {
+            case 0x01: return 0;  // MENU
+            case 0x02: return 2;  // BACK
+            case 0x04: return 1;  // OPTIONS
+            case 0x08: return 3;  // COM
+            case 0x10: return 4;  // MEDIA
+            case 0x20: return 5;  // NAV (bit position unconfirmed on this car)
+            case 0x40: return 6;  // MAP
+            default:   return -1;
+        }
+    }
+
     // 12-step clock direction -> DPAD key (0 = centred / unknown).
     static uint32_t tiltKey(unsigned dir) {
         if (dir == 0 || dir > 12) return 0;
@@ -85,8 +107,8 @@ public:
     int feed(uint8_t fblock, uint8_t inst, uint16_t fkt, uint8_t op, const uint8_t* d, size_t n,
              CcsEvent* out, int max) {
         int k = 0;
-        if (fblock != 0xE5 || inst != inst_ || op != 0xC || !d) return 0;
-        if (fkt == 0xC46 && n >= 5) {
+        if (fblock != 0xE5 || op != 0xC || !d) return 0;
+        if (inst == inst_ && fkt == 0xC46 && n >= 5) {
             int pos = (d[1] << 8) | d[2];
             if (lastPos_ >= 0 && pos != lastPos_) {
                 int delta = (int)(int16_t)(uint16_t)(pos - lastPos_);   // wrap-safe
@@ -105,13 +127,48 @@ public:
                 add(out, max, k, 1, AAK_DPAD_CENTER, push ? 1 : 0, 0, "PUSH");
                 pushDown_ = push;
             }
-        } else if ((fkt == 0xC47 || fkt == 0xC4F) && n >= 1) {
+        } else if (inst == inst_ && (fkt == 0xC47 || fkt == 0xC4F) && n >= 1) {
             for (size_t i = 0; i < n && i < (size_t)CCS_SLOTS; ++i) {
                 bool p = d[i] != 0;
                 if (p != slot_[i]) {
                     slot_[i] = p;
                     if (slotKey_[i]) add(out, max, k, 1, slotKey_[i], p ? 1 : 0, 0, slotName_[i]);
                     else add(out, max, k, 1, 0, p ? 1 : 0, 0, slotName_[i]);   // unmapped: keycode 0, caller logs only
+                }
+            }
+        } else if (fkt == 0xC10 && n >= 5) {
+            // Variant B rotary (FBlock E5 inst 0x01): BE16 absolute detent position at d[3..4].
+            int pos = (d[3] << 8) | d[4];
+            if (lastPos_ >= 0 && pos != lastPos_) {
+                int delta = (int)(int16_t)(uint16_t)(pos - lastPos_);   // wrap-safe; + = CW/right
+                if (invert_) delta = -delta;
+                if (delta != 0) add(out, max, k, 2, AAK_ROTARY_CONTROLLER, 0, delta, "ROTARY");
+            }
+            lastPos_ = pos;
+        } else if (fkt == 0xC20 && n >= 7) {
+            // Variant B tilt / centre push / hard keys. d[3]=down(1)/up(0); category in d[5]:
+            //   0x1d tilt (bit in d[4]), 0x1e centre push, 0x00 hard key (bitmask in d[6]).
+            bool down = d[3] != 0;
+            if (d[5] == 0x1d) {                        // joystick tilt
+                if (down) {
+                    uint32_t tk = tiltKeyV2(d[4]);
+                    if (tk && tiltKey_ != tk) {
+                        if (tiltKey_) add(out, max, k, 1, tiltKey_, 0, 0, tiltName(tiltKey_));
+                        add(out, max, k, 1, tk, 1, 0, tiltName(tk));
+                        tiltKey_ = tk;
+                    }
+                } else if (tiltKey_) {                 // release: d[4] is cleared, use remembered tilt
+                    add(out, max, k, 1, tiltKey_, 0, 0, tiltName(tiltKey_));
+                    tiltKey_ = 0;
+                }
+            } else if (d[5] == 0x1e) {                 // centre push
+                if (down != pushDown_) { add(out, max, k, 1, AAK_DPAD_CENTER, down ? 1 : 0, 0, "PUSH"); pushDown_ = down; }
+            } else if (d[6] != 0) {                     // hard key (bitmask in d[6])
+                int slot = keyBitToSlot(d[6]);
+                if (slot >= 0 && down != slot_[slot]) {
+                    slot_[slot] = down;
+                    if (slotKey_[slot]) add(out, max, k, 1, slotKey_[slot], down ? 1 : 0, 0, slotName_[slot]);
+                    else add(out, max, k, 1, 0, down ? 1 : 0, 0, slotName_[slot]);
                 }
             }
         }

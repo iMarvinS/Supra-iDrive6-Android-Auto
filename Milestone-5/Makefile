@@ -11,9 +11,12 @@ CC  = $(QCC) -Vgcc_ntoarmv7le
 
 INCLUDES = -I./include -I./src
 # Remove -fPIC and -Bdynamic to produce a true QNX executable (ET_EXEC), not a shared lib (ET_DYN)
-CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -Wc,-std=gnu++0x -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp $(INCLUDES)
-# Set RPATH so QNX's dynamic linker automatically finds liba2i_client.so in /opt/mm/lib without copying
-LDFLAGS  = -L./lib -la2i_client -lsocket -lssl -lcrypto -lscreen -lang-c++ -Wl,-rpath,/opt/mm/lib:/lib:/usr/lib
+# -Wc,-include,cstddef/cstdint: QNX 6.5 headers + modern GCC (podman 4.9 image) don't agree on size_t/uintN_t.
+CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -Wc,-std=gnu++0x -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -Wc,-include,cstddef -Wc,-include,cstdint $(INCLUDES)
+# Set RPATH so QNX's dynamic linker automatically finds liba2i_client.so in /opt/mm/lib without copying.
+# libssl/libcrypto by explicit path (not -lssl -lcrypto): the QNX gcc spec searches the sysroot libdir
+# before -L./lib, and the old sysroot OpenSSL doesn't export TLSv1_2_client_method.
+LDFLAGS  = -L./lib -la2i_client -lsocket ./lib/libssl.so ./lib/libcrypto.so -lscreen -lang-c++ -Wl,-rpath,/opt/mm/lib:/lib:/usr/lib
 
 SRCS = src/main.cpp \
        src/audio_manager.cpp \
@@ -33,7 +36,9 @@ SRCS = src/main.cpp \
        src/sdr_builder.cpp \
        src/crash_handler.cpp
 
-OBJS = $(SRCS:.cpp=.o)
+BUILD_DIR = build
+# Object files go into build/ (mirrors src/ basenames), not next to the sources.
+OBJS = $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 TARGET = nbt-aad
 
 .PHONY: all clean
@@ -58,6 +63,10 @@ test_controls: test_controls.cpp src/dsi_client.cpp src/dsi_client.hpp src/most_
 # ---- HmiMain3D plugin (plugin/): GNU libstdc++ (_gpp variant) to match BMW's plugins, PIC shared object ----
 PLUGIN_CXX      = $(QCC) -Vgcc_ntoarmv7le_gpp
 PLUGIN_CXXFLAGS = -O2 -Wall -D_QNX_SOURCE -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -fPIC -I./plugin
+# rhmiapp/nbt_aad_app.cpp pulls <spawn.h> -> sys/types.h, whose size_t typedef miscompiles on QNX 6.5
+# unless cstddef/cstdint are force-included first; those headers in turn need C++11. Kept local to the
+# rhmiapp recipe so the plain-C++ plugin build (libhmiaad.so) is unaffected.
+RHMI_CXXFLAGS   = $(PLUGIN_CXXFLAGS) -Wc,-std=gnu++0x -Wc,-include,cstddef -Wc,-include,cstdint
 PLUGIN_RPATH    = -Wl,-rpath,/lib:/usr/lib:/fs/sda0/repository/istep/lib:/opt/hmi/ID5/lib
 
 # ---- native iDrive PluginApp (rhmiapp/): libNbtAad.so + manifest/XML/DBs -> /opt/hmi/ID5/data/ro/Plugins/NbtAad ----
@@ -70,7 +79,7 @@ rhmiapp: rhmiapp/libNbtAad.so
 
 rhmiapp/libNbtAad.so: rhmiapp/nbt_aad_app.cpp
 	@echo [BUILD] PluginApp $@
-	$(PLUGIN_CXX) $(PLUGIN_CXXFLAGS) -shared -Wl,-soname,libNbtAad.so -o $@ rhmiapp/nbt_aad_app.cpp $(RHMI_LIBS) -Wl,--allow-shlib-undefined -lang-c++
+	$(PLUGIN_CXX) $(RHMI_CXXFLAGS) -shared -Wl,-soname,libNbtAad.so -o $@ rhmiapp/nbt_aad_app.cpp $(RHMI_LIBS) -Wl,--allow-shlib-undefined -lang-c++
 	@echo [DONE] Built $@ - install with NbtAad.manifest, NbtAad.xml, NbtAad_ALL_*.zip into Plugins/NbtAad
 
 .PHONY: plugin
@@ -88,10 +97,14 @@ plugin/plugin_check: plugin/plugin_check.cpp plugin/plugin_abi.hpp
 	$(PLUGIN_CXX) -O2 -Wall -D_QNX_SOURCE -march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp -I./plugin -o $@ plugin/plugin_check.cpp -lang-c++ $(PLUGIN_RPATH)
 	@echo [DONE] Built $@
 
-%.o: %.cpp
+# Compile src/<name>.cpp -> build/<name>.o (order-only dep creates the dir)
+$(BUILD_DIR)/%.o: src/%.cpp | $(BUILD_DIR)
 	@echo [CXX] $<
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
+
 clean:
-	@echo [CLEAN] Removing object files and binaries
-	rm -f $(OBJS) $(TARGET) test_display test_controls plugin/libhmiaad.so plugin/plugin_check
+	@echo [CLEAN] Removing build directory and binaries
+	rm -rf $(BUILD_DIR) $(TARGET) test_display test_controls plugin/libhmiaad.so plugin/plugin_check rhmiapp/libNbtAad.so
