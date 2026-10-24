@@ -53,6 +53,7 @@ namespace {
 
 const char* const kDaemon     = "/opt/aa/nbt-aad";
 const char* const kDisable    = "/opt/aa/menu.disable";
+const char* const kCarplayGateOff = "/opt/aa/carplay-gate.disable";   // touch to skip the CarPlay-gate write
 const char* const kMenuCfg    = "/opt/aa/menu.cfg";
 const char* const kDaemonEnv  = "/opt/aa/nbt-aad.env";
 const char* const kDaemonLog  = "/dev/shmem/nbt-aad.log";
@@ -251,7 +252,14 @@ public:
     NbtAadGate() { plog("gate plugin constructed (%p)", (void*)this); }
     virtual ~NbtAadGate() { plog("gate plugin destroyed (%p)", (void*)this); }
     virtual int start(void* resolver) {
-        plog("gate plugin start(resolver %p) - input gate not implemented, iDrive input untouched", resolver);
+        plog("gate plugin start(resolver %p) pid %d", resolver, (int)getpid());
+        // Open the CarPlay projection coding gate (VACodingFeature 0x5153) at runtime so the HMI's own
+        // native-input suppression / projection machinery can engage on a car not coded for it. RAM only.
+        if (fileExists(kCarplayGateOff)) { plog("carplay gate disabled (%s exists)", kCarplayGateOff); return 0; }
+        if (!dlsym(RTLD_DEFAULT, "_ZN10THmiStringItEC1ItvEEPKc")) { plog("not inside HmiMain3D - carplay gate skipped"); return 0; }
+        if (!nbt::hmi::loadSymbols()) { plog("carplay gate: loadSymbols failed - skipped"); return 0; }
+        int r = nbt::hmi::setVariantIvaFlag(resolver, 0x5153u);   // CarPlay projection
+        plog("carplay gate (0x5153) -> %s", r == 1 ? "SET" : (r == 0 ? "server not found" : "layout unverified / not written"));
         return 0;
     }
     virtual int stop(void* resolver) {

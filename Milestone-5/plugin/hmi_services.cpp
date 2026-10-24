@@ -91,6 +91,40 @@ void* findAppProcUnit(void* disp) {
     return found;
 }
 
+// CHmiVariantServer (libhmicoding.so, registered as static plugin "IHmiVariantServer") answers
+// isVariantSet(feature) for IVA-range features [0x4e21..0x5480] from an in-object array, NOT from the CAFD blob:
+//   isVariantSetInternal(f):  return (f == *(int*)(this + (f-0x4e0c)*8 + 4)) ? *(u8*)(this + (f-0x4e0c)*8 + 8) : 0
+//   ___IVAfillEntry(f,val):   *(u8*)(this+(f-0x4e0c)*8+8) = val;  *(int*)(this+(f-0x4e0c)*8+4) = f
+// The entry's id field is populated at init, so we can flip a gate (e.g. CarPlay 0x5153) at runtime by writing
+// the value byte. We first read the id field back as a layout self-test: only if it already equals `feature`
+// (i.e. our object pointer and offset are correct) do we write, so a wrong pointer can never corrupt memory.
+// RAM only -> reverts on reboot. Neither ___IVAfillEntry nor isVariantSet is an exported symbol, so we reach the
+// array through the resolved object pointer and the arithmetic above (not dlsym).
+int setVariantIvaFlag(void* resolver, unsigned feature) {
+    if (!s_strCtor && !loadSymbols()) { nbtPluginLog("IVA: loadSymbols failed"); return 0; }
+    void* vs = resolvePlugin(resolver, "IHmiVariantServer");
+    if (!vs) { nbtPluginLog("IVA: IHmiVariantServer not resolvable from this resolver"); return 0; }
+    const char* rn = rttiName(vs);
+    if (!strstr(rn, "VariantServer")) { nbtPluginLog("IVA: resolved RTTI '%s' is not a variant server - abort", rn); return 0; }
+    if (feature < 0x4e21u || feature > 0x5480u) { nbtPluginLog("IVA: feature 0x%x outside IVA range [0x4e21..0x5480]", feature); return -1; }
+
+    char* base = reinterpret_cast<char*>(vs);
+    size_t slot = (size_t)(feature - 0x4e0cu) * 8;                 // same index base as isVariantSetInternal
+    int32_t* idField = reinterpret_cast<int32_t*>(base + slot + 4);
+    volatile uint8_t* valByte = reinterpret_cast<volatile uint8_t*>(base + slot + 8);
+
+    // Layout self-test: the IVA entry for this feature must already carry its id (filled at init).
+    if (*idField != static_cast<int32_t>(feature)) {
+        nbtPluginLog("IVA 0x%x: id field @%p = 0x%x (expected 0x%x) -> layout unverified, NOT writing (server %p rtti %s)",
+                     feature, (void*)idField, (unsigned)*idField, feature, vs, rn);
+        return -1;
+    }
+    uint8_t prev = *valByte;
+    *valByte = 1;                                                  // replicate ___IVAfillEntry(feature, true)
+    nbtPluginLog("IVA 0x%x SET on %s (%p): value byte @%p %u -> %u", feature, rn, vs, (void*)valByte, prev, (unsigned)*valByte);
+    return (*valByte == 1) ? 1 : -1;
+}
+
 // IHmiProcUnit vtbl[3] = getTimer(); IHmiTimer vtbl[1] = setTimer(target, memfn{fn, adj}, first, period, user).
 int armTimer(void* pu, void* target, TimerFn fn, unsigned delayMs) {
     if (!pu) return 0;

@@ -23,6 +23,13 @@ void* findAppProcUnit(void* mainDispatcher);
 typedef void (*TimerFn)(void* target, unsigned timerId, unsigned user, unsigned extra);
 int armTimer(void* procUnit, void* target, TimerFn fn, unsigned delayMs);
 
+// Set a runtime IVA variant flag on CHmiVariantServer (resolved by name "IHmiVariantServer"), i.e. make
+// isVariantSet(feature) return true. Used to open a coding gate (e.g. CarPlay 0x5153) the car isn't coded for.
+// Self-verifying: only writes if the IVA entry's id field already holds `feature` at the computed offset, so a
+// wrong object/layout can never corrupt memory.
+// Returns: 1 = set, 0 = server not found / not a variant server, -1 = layout unverified (nothing written).
+int setVariantIvaFlag(void* resolver, unsigned feature);
+
 } // namespace hmi
 } // namespace nbt
 
