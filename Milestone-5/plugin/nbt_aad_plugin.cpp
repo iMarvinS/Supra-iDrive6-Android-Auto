@@ -24,6 +24,7 @@
 #include "plugin_abi.hpp"
 #include "hmi_services.hpp"
 #include "hmi_menu.hpp"
+#include "hmi_player.hpp"
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -54,6 +55,8 @@ namespace {
 const char* const kDaemon     = "/opt/aa/nbt-aad";
 const char* const kDisable    = "/opt/aa/menu.disable";
 const char* const kCarplayGateOff = "/opt/aa/carplay-gate.disable";   // touch to skip the CarPlay-gate write
+const char* const kPlayerArm  = "/opt/aa/player.enable";   // touch to ARM Weg-B projection-player registration
+const char* const kPlayerOff  = "/opt/aa/player.disable";  // touch to force-skip it even if armed
 const char* const kMenuCfg    = "/opt/aa/menu.cfg";
 const char* const kDaemonEnv  = "/opt/aa/nbt-aad.env";
 const char* const kDaemonLog  = "/dev/shmem/nbt-aad.log";
@@ -188,23 +191,41 @@ void onEntrySelected(void*) { launchDaemon(); }
 // ---- HMI-thread scheduling --------------------------------------------------------------------
 void* g_dispatcher = NULL;
 void* g_appUnit = NULL;
+void* g_resolver = NULL;                      // framework resolver (for IHmiHome etc.)
 int   g_tries = 0;
 int   g_timerTarget = 0;                     // address used as the timer target
+bool  g_menuWanted = false;                   // Communication menu entry wanted (daemon installed, not disabled)
+bool  g_playerArmed = false;                  // Weg-B projection player explicitly armed via file
+bool  g_playerDone = false;                   // registered (or permanently failed)
 
 void onHmiTimer(void*, unsigned timerId, unsigned, unsigned) {
     ++g_tries;
-    nbt::hmi::MenuEntryCfg cfg;
-    cfg.menuName = g_cfg.menu;
-    cfg.fallbackState = "ST_MyV_DeviceList";
-    cfg.text = g_cfg.text; cfg.icon = g_cfg.icon; cfg.focus = g_cfg.focus; cfg.order = g_cfg.order;
-    int r = nbt::hmi::addMenuEntry(cfg, &onEntrySelected);
-    if (r == 0 && g_tries < 240) {
-        if (g_tries == 1 || g_tries % 20 == 0) plog("HMI timer %u: menu %s not built yet (try %d)", timerId, g_cfg.menu, g_tries);
+    bool menuPending = false;
+    if (g_menuWanted) {
+        nbt::hmi::MenuEntryCfg cfg;
+        cfg.menuName = g_cfg.menu;
+        cfg.fallbackState = "ST_MyV_DeviceList";
+        cfg.text = g_cfg.text; cfg.icon = g_cfg.icon; cfg.focus = g_cfg.focus; cfg.order = g_cfg.order;
+        int r = nbt::hmi::addMenuEntry(cfg, &onEntrySelected);
+        menuPending = (r == 0);
+        if (r < 0) { g_menuWanted = false; plog("menu entry not added (see above)"); }
+    }
+
+    // Weg B (projection player) - only when explicitly armed; runs here on the HMI thread.
+    bool playerPending = false;
+    if (g_playerArmed && !g_playerDone) {
+        int pr = nbt::hmi::registerProjectionPlayer(g_resolver);
+        if (pr == 0) { playerPending = true; }   // mainMenu not found yet, retry
+        else { g_playerDone = true; plog("player: registration finished (rc %d)", pr); }
+    }
+
+    if ((menuPending || playerPending) && g_tries < 240) {
+        if (g_tries == 1 || g_tries % 20 == 0)
+            plog("HMI timer %u: pending (menu=%d player=%d, try %d)", timerId, menuPending, playerPending, g_tries);
         nbt::hmi::armTimer(g_appUnit, &g_timerTarget, &onHmiTimer, 500);
-    } else if (r == 0) {
-        plog("gave up: menu %s not found after %d tries", g_cfg.menu, g_tries);
-    } else if (r < 0) {
-        plog("menu entry not added (see above)");
+    } else {
+        if (menuPending) plog("gave up: menu %s not found after %d tries", g_cfg.menu, g_tries);
+        if (playerPending) plog("gave up: CHmiActivityMainMenu not found after %d tries", g_tries);
     }
 }
 
@@ -220,14 +241,28 @@ void* helperThread(void*) {
 }
 
 void startMenuEntry(void* resolver) {
-    if (fileExists(kDisable)) { plog("menu entry disabled (%s exists)", kDisable); return; }
-    if (!fileExists(kDaemon)) { plog("menu entry off: %s not installed", kDaemon); return; }
+    g_resolver = resolver;
+    // Weg-B projection player is opt-in (untested on-car; mutates the safety-critical HMI). Arm with
+    // /opt/aa/player.enable, force-skip with /opt/aa/player.disable. Requires the 0x5153 gate plugin.
+    g_playerArmed = fileExists(kPlayerArm) && !fileExists(kPlayerOff);
+    if (g_playerArmed) plog("projection player ARMED (%s present) - will attempt registration on HMI thread", kPlayerArm);
+
+    g_menuWanted = !fileExists(kDisable) && fileExists(kDaemon);
+    if (!g_menuWanted) {
+        if (fileExists(kDisable)) plog("menu entry disabled (%s exists)", kDisable);
+        else plog("menu entry off: %s not installed", kDaemon);
+    }
+    if (!g_menuWanted && !g_playerArmed) return;   // nothing to do on the HMI thread
+
     if (!nbt::hmi::loadSymbols()) return;
-    if (!dlsym(RTLD_DEFAULT, "_ZN10THmiStringItEC1ItvEEPKc")) { plog("not inside HmiMain3D - menu entry skipped"); return; }
-    if (!nbt::hmi::checkMenuFirmware()) return;
-    readMenuCfg();
+    if (!dlsym(RTLD_DEFAULT, "_ZN10THmiStringItEC1ItvEEPKc")) { plog("not inside HmiMain3D - HMI-thread work skipped"); return; }
+    if (g_menuWanted && !nbt::hmi::checkMenuFirmware()) g_menuWanted = false;
+    if (g_playerArmed && !nbt::hmi::checkPlayerFirmware()) { g_playerArmed = false; plog("projection player disarmed: firmware check failed"); }
+    if (!g_menuWanted && !g_playerArmed) return;
+    if (g_menuWanted) readMenuCfg();
+
     g_dispatcher = nbt::hmi::resolvePlugin(resolver, "CHmiMainDispatcher");
-    if (!g_dispatcher) { plog("CHmiMainDispatcher not available - no menu entry"); return; }
+    if (!g_dispatcher) { plog("CHmiMainDispatcher not available - no HMI-thread work"); return; }
     pthread_t t;
     if (pthread_create(&t, NULL, &helperThread, NULL) == 0) pthread_detach(t);
 }

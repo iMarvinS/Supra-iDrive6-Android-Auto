@@ -85,9 +85,9 @@ rhmiapp/libNbtAad.so: rhmiapp/nbt_aad_app.cpp
 .PHONY: plugin
 plugin: plugin/libhmiaad.so plugin/plugin_check rhmiapp/libNbtAad.so
 
-PLUGIN_SRCS = plugin/nbt_aad_plugin.cpp plugin/hmi_services.cpp plugin/hmi_menu.cpp
+PLUGIN_SRCS = plugin/nbt_aad_plugin.cpp plugin/hmi_services.cpp plugin/hmi_menu.cpp plugin/hmi_player.cpp
 
-plugin/libhmiaad.so: $(PLUGIN_SRCS) plugin/plugin_abi.hpp plugin/hmi_services.hpp plugin/hmi_menu.hpp
+plugin/libhmiaad.so: $(PLUGIN_SRCS) plugin/plugin_abi.hpp plugin/hmi_services.hpp plugin/hmi_menu.hpp plugin/hmi_player.hpp
 	@echo [CXX] $@
 	$(PLUGIN_CXX) $(PLUGIN_CXXFLAGS) -shared -Wl,-soname,libhmiaad.so -o $@ $(PLUGIN_SRCS) -lang-c++
 	@echo [DONE] Built $@ - install next to plugin/NbtAadPlugin.xml in hmiplugins
