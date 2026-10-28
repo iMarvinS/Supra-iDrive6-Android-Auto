@@ -9,8 +9,9 @@
 namespace nbt {
 namespace hmi {
 
-// Verify the (non-exported) HmiMain3D functions the player path uses against this firmware build.
-// Call once before registerProjectionPlayer / setProjectionActive. false (and logs) on any mismatch.
+// Locate, at runtime, the (non-exported) HmiMain3D functions + the CHmiCarPlayApplication ctor/vtable the
+// player path uses - by trace strings and RTTI, with no fixed addresses or offsets (binary-independent).
+// Call once before registerProjectionPlayer / setProjectionActive. false (and logs) if anything can't be derived.
 bool checkPlayerFirmware();
 
 // Build a real CHmiCarPlayApplication descriptor with iDrive's own ctor, register it with the
@@ -18,12 +19,12 @@ bool checkPlayerFirmware();
 // suppression (onCarPlayStateChanged). Requires the 0x5153 IVA gate set first (see setVariantIvaFlag).
 //   1 = registered (+ activation attempted)
 //   0 = mainMenu instance not found yet (safe to retry later)
-//  -1 = firmware/RTTI check failed, or already registered (do not retry)
-// The CHmiActivityMainMenu is reached from the resolver via IHmiHome + a pinned offset (see findMainMenu).
+//  -1 = derivation/RTTI check failed, or already registered (do not retry)
+// The CHmiActivityMainMenu is reached from the resolver via IHmiHome by an RTTI scan (see findMainMenu).
 int registerProjectionPlayer(void* resolver);
 
 // Toggle native-input suppression on the already-registered player (onCarPlayStateChanged(active)).
-//   1 = toggled, 0 = no registered player / mainMenu, -1 = firmware check not passed.
+//   1 = toggled, 0 = no registered player / mainMenu, -1 = targets not derived.
 int setProjectionActive(bool active);
 
 } // namespace hmi
