@@ -25,9 +25,10 @@ int armTimer(void* procUnit, void* target, TimerFn fn, unsigned delayMs);
 
 // Set a runtime IVA variant flag on CHmiVariantServer (resolved by name "IHmiVariantServer"), i.e. make
 // isVariantSet(feature) return true. Used to open a coding gate (e.g. CarPlay 0x5153) the car isn't coded for.
-// Self-verifying: only writes if the IVA entry's id field already holds `feature` at the computed offset, so a
-// wrong object/layout can never corrupt memory.
-// Returns: 1 = set, 0 = server not found / not a variant server, -1 = layout unverified (nothing written).
+// Binary-independent: the entry array is located by its shape (consecutive ids + boolean values) at runtime,
+// not by fixed stride/base/range; the write only happens when the id word at the computed entry equals
+// `feature`, so a wrong object/layout can never corrupt memory.
+// Returns: 1 = set, 0 = server not found / not a variant server, -1 = array/entry unverified (nothing written).
 int setVariantIvaFlag(void* resolver, unsigned feature);
 
 } // namespace hmi

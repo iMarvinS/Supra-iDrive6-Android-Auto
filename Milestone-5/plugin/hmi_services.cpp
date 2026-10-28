@@ -92,36 +92,69 @@ void* findAppProcUnit(void* disp) {
 }
 
 // CHmiVariantServer (libhmicoding.so, registered as static plugin "IHmiVariantServer") answers
-// isVariantSet(feature) for IVA-range features [0x4e21..0x5480] from an in-object array, NOT from the CAFD blob:
-//   isVariantSetInternal(f):  return (f == *(int*)(this + (f-0x4e0c)*8 + 4)) ? *(u8*)(this + (f-0x4e0c)*8 + 8) : 0
-//   ___IVAfillEntry(f,val):   *(u8*)(this+(f-0x4e0c)*8+8) = val;  *(int*)(this+(f-0x4e0c)*8+4) = f
-// The entry's id field is populated at init, so we can flip a gate (e.g. CarPlay 0x5153) at runtime by writing
-// the value byte. We first read the id field back as a layout self-test: only if it already equals `feature`
-// (i.e. our object pointer and offset are correct) do we write, so a wrong pointer can never corrupt memory.
-// RAM only -> reverts on reboot. Neither ___IVAfillEntry nor isVariantSet is an exported symbol, so we reach the
-// array through the resolved object pointer and the arithmetic above (not dlsym).
+// isVariantSet(feature) from a dense in-object array of {int32 id; uint8 value; ...} entries indexed by
+// feature (each id filled at init), NOT from the CAFD blob. We flip a gate (e.g. CarPlay 0x5153) by setting
+// the value byte of its entry to 1 (RAM only -> reverts on reboot; nothing dlsym'd or hard-addressed).
+//
+// Binary-independent: no fixed stride / base-index / feature-range. The array is found by its self-evident
+// SHAPE - three entries whose ids are consecutive integers N, N+1, N+2 and whose value bytes are boolean -
+// which yields the array origin, the entry stride and a reference id. We then jump to the requested feature's
+// entry and only write if the id word there really equals the feature, so a wrong geometry can never corrupt
+// memory. The one remaining local fact is that the value byte sits right after the 4-byte id (guarded: it must
+// read back as 0/1).
+namespace {
+const size_t kIvaScanCap = 0x8000;                 // numeric read guard only (the variant-server object is large)
+inline int32_t ivaI32(const void* b, size_t o) { return *reinterpret_cast<const volatile int32_t*>(reinterpret_cast<const char*>(b) + o); }
+inline uint8_t ivaU8 (const void* b, size_t o) { return *reinterpret_cast<const volatile uint8_t*>(reinterpret_cast<const char*>(b) + o); }
+
+// Locate the IVA entry array: origin offset, its first id, and the entry stride. False if the shape is absent.
+bool findIvaArray(const void* vs, size_t& origin, int32_t& firstId, size_t& stride) {
+    for (size_t a = 4; a + 8 <= kIvaScanCap; a += 4) {
+        int32_t n = ivaI32(vs, a);
+        if (n < 0x100 || n > 0x100000) continue;             // a small int id, not a pointer / garbage
+        if (ivaU8(vs, a + 4) > 1) continue;                  // value byte must be boolean
+        for (size_t s = 4; s <= 64; s += 4) {
+            if (a + 2 * s + 5 > kIvaScanCap) break;
+            if (ivaI32(vs, a + s) == n + 1 && ivaI32(vs, a + 2 * s) == n + 2 &&
+                ivaU8(vs, a + s + 4) <= 1 && ivaU8(vs, a + 2 * s + 4) <= 1) {
+                origin = a; firstId = n; stride = s; return true;   // three consecutive ids + boolean values
+            }
+        }
+    }
+    return false;
+}
+} // namespace
+
 int setVariantIvaFlag(void* resolver, unsigned feature) {
     if (!s_strCtor && !loadSymbols()) { nbtPluginLog("IVA: loadSymbols failed"); return 0; }
     void* vs = resolvePlugin(resolver, "IHmiVariantServer");
     if (!vs) { nbtPluginLog("IVA: IHmiVariantServer not resolvable from this resolver"); return 0; }
     const char* rn = rttiName(vs);
     if (!strstr(rn, "VariantServer")) { nbtPluginLog("IVA: resolved RTTI '%s' is not a variant server - abort", rn); return 0; }
-    if (feature < 0x4e21u || feature > 0x5480u) { nbtPluginLog("IVA: feature 0x%x outside IVA range [0x4e21..0x5480]", feature); return -1; }
 
-    char* base = reinterpret_cast<char*>(vs);
-    size_t slot = (size_t)(feature - 0x4e0cu) * 8;                 // same index base as isVariantSetInternal
-    int32_t* idField = reinterpret_cast<int32_t*>(base + slot + 4);
-    volatile uint8_t* valByte = reinterpret_cast<volatile uint8_t*>(base + slot + 8);
-
-    // Layout self-test: the IVA entry for this feature must already carry its id (filled at init).
-    if (*idField != static_cast<int32_t>(feature)) {
-        nbtPluginLog("IVA 0x%x: id field @%p = 0x%x (expected 0x%x) -> layout unverified, NOT writing (server %p rtti %s)",
-                     feature, (void*)idField, (unsigned)*idField, feature, vs, rn);
+    size_t origin = 0, stride = 0;
+    int32_t firstId = 0;
+    if (!findIvaArray(vs, origin, firstId, stride)) {
+        nbtPluginLog("IVA 0x%x: entry-array shape not found on %s (%p) - not writing", feature, rn, vs);
         return -1;
     }
+    long target = (long)origin + ((long)feature - (long)firstId) * (long)stride;
+    if (target < 4 || (size_t)target + 5 > kIvaScanCap) {
+        nbtPluginLog("IVA 0x%x: computed entry @+0x%lx out of range (array@+0x%zx stride %zu id0 0x%x)",
+                     feature, target, origin, stride, (unsigned)firstId);
+        return -1;
+    }
+    // Self-test: the id at the computed entry must equal the feature, else our geometry is wrong -> no write.
+    if (ivaI32(vs, (size_t)target) != static_cast<int32_t>(feature)) {
+        nbtPluginLog("IVA 0x%x: id @computed +0x%lx = 0x%x != feature -> not writing (array@+0x%zx stride %zu)",
+                     feature, target, (unsigned)ivaI32(vs, (size_t)target), origin, stride);
+        return -1;
+    }
+    volatile uint8_t* valByte = reinterpret_cast<volatile uint8_t*>(reinterpret_cast<char*>(vs) + target + 4);
     uint8_t prev = *valByte;
-    *valByte = 1;                                                  // replicate ___IVAfillEntry(feature, true)
-    nbtPluginLog("IVA 0x%x SET on %s (%p): value byte @%p %u -> %u", feature, rn, vs, (void*)valByte, prev, (unsigned)*valByte);
+    *valByte = 1;                                                 // flip the gate (replicates ___IVAfillEntry value)
+    nbtPluginLog("IVA 0x%x SET on %s (%p): array@+0x%zx stride %zu id0 0x%x, value @+0x%lx %u -> %u",
+                 feature, rn, vs, origin, stride, (unsigned)firstId, target + 4, prev, (unsigned)*valByte);
     return (*valByte == 1) ? 1 : -1;
 }
 
