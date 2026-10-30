@@ -226,6 +226,19 @@ On/off settings accept `1`/`0`; most also accept `on`/`off`, `yes`/`no` and `tru
 | `NBT_VEHICLE` | from `carplay.ini` | `toyota` or `bmw`: identity the phone shows (exit icon) |
 | `NBT_SCREEN` | from `carplay.ini` | Panel size, e.g. `1440x540` (BMW 10.25") |
 
+### Head-unit wireless bringup (non-CarPlay units)
+
+| Setting | Default | Effect |
+|---|---|---|
+| `NBT_HU_BOOTSTRAP` | off | Turn **on** (`1`) on **non-CarPlay** head units: at HMI startup the plugin runs `/opt/aa/hu-bootstrap.sh`, which brings up the `uap0` micro-AP, its DHCP (`dnsmasq-aa`) and the CarPlay `mm-renderer` — exactly what `tools/hu-up.sh` does by hand. Leave it **off** on CarPlay-equipped units: the stock CarPlay stack already brings all of this up, so it is unnecessary there (and re-running could disturb the live AP). |
+
+Unlike the settings above (read by the **daemon** when you press Start), `NBT_HU_BOOTSTRAP` is read by the
+**plugin** from `nbt-aad.env` at HMI startup. The bringup runs once per boot and is idempotent (safe to re-run).
+
+Two extra files must sit in `/opt/aa` for this to work (install them next to `nbt-aad`):
+`hu-bootstrap.sh` (from `rhmiapp/`) and `uaptool` (the Marvell micro-AP tool, from `aa-supra/tools/`).
+Its log: `/dev/shmem/hu-bootstrap.log`.
+
 ### Features you can turn off (all on by default)
 
 | Setting | Turn off with | What it does |

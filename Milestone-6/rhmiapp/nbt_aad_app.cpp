@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <new>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <spawn.h>
 #include <dlfcn.h>
 #ifndef RTLD_DEFAULT
@@ -143,6 +144,12 @@ const char* const kDisable    = "/opt/aa/app.disable";
 const char* const kDaemonEnv  = "/opt/aa/nbt-aad.env";
 const char* const kDaemonLog  = "/dev/shmem/nbt-aad.log";
 const char* const kAppLog     = "/dev/shmem/nbt-aad-app.log";
+// Head-unit wireless bringup (micro-AP + DHCP + CarPlay mm-renderer), run once at startup on CarPlay-
+// equipped units. See hu-bootstrap.sh; gated by NBT_HU_BOOTSTRAP (default off).
+const char* const kBootstrap    = "/opt/aa/hu-bootstrap.sh";
+const char* const kBootstrapLog = "/dev/shmem/hu-bootstrap.log";
+const char* const kBootstrapEnv = "NBT_HU_BOOTSTRAP";
+const int         kBootstrapMaxWaitS = 15;   // cap the synchronous wait so a hung step can't stall the HMI
 const unsigned    kEntryAction = 2;          // <entryButton action="2"> / <raAction id="2"/> in NbtAad.xml
 const char* const kGearProperty = "driving.gear";   // CDS property (libhmiremoting.so property table)
 const char* const kGearFile    = "/dev/shmem/nbt-aad-gear";
@@ -278,6 +285,99 @@ void launchDaemon() {
     close(out);
     if (pid < 0) alog("launch: spawn %s failed (errno %d)", kDaemon, e);
     else alog("launch: started %s pid %d (%d env overrides, output -> %s)", kDaemon, (int)pid, nb, kDaemonLog);
+}
+
+// ---- head-unit wireless bringup (AP + DHCP + mm-renderer) ---------------------------------------------------------
+// hu-bootstrap.sh does what aa-supra/tools/hu-up.sh does by hand: bring up uap0, the micro-AP, DHCP and the
+// CarPlay mm-renderer so the daemon (started later from the menu) finds the AP and hardware decoder ready.
+// It runs once at startup, gated by NBT_HU_BOOTSTRAP. This is for NON-CarPlay units, where those CarPlay
+// components ship on the image but are never started; on a CarPlay-equipped unit the stock CarPlay stack
+// already brings them up, so the toggle stays off there (and re-running would risk disrupting the live AP).
+// The plugin runs inside HmiMain3D and does not inherit /opt/aa/nbt-aad.env, so the toggle is read from
+// that file (same way menuReturnEvent() reads NBT_MENU_RETURN). Default: off.
+bool envTruthy(const char* v) {
+    return v && *v && !(strcmp(v, "0") == 0 || strcmp(v, "off") == 0 || strcmp(v, "no") == 0 || strcmp(v, "false") == 0);
+}
+
+bool huBootstrapEnabled() {
+    FILE* f = fopen(kDaemonEnv, "r");
+    if (!f) return false;
+    size_t klen = strlen(kBootstrapEnv);
+    char line[160];
+    bool on = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, kBootstrapEnv, klen) != 0 || line[klen] != '=') continue;
+        char* v = line + klen + 1;
+        size_t l = strlen(v);
+        while (l && (v[l - 1] == '\n' || v[l - 1] == '\r' || v[l - 1] == ' ')) v[--l] = 0;
+        on = envTruthy(v);
+    }
+    fclose(f);
+    return on;
+}
+
+// Runs hu-bootstrap.sh (output -> kBootstrapLog), at most once per process. Logs just before the script
+// starts and again when it finishes. Synchronous but bounded: it waits for the script (a few seconds in
+// the normal case) so the "finished" line is truthful, and gives up after kBootstrapMaxWaitS so a hung
+// step can never stall HMI startup for good.
+void runHuBootstrap() {
+    static bool s_ran = false;
+    if (s_ran) return;
+    if (!huBootstrapEnabled()) { alog("HU bootstrap off (%s not set in %s); AP/DHCP/mm-renderer bringup skipped", kBootstrapEnv, kDaemonEnv); return; }
+    if (!fileExists(kBootstrap)) { alog("HU bootstrap on but %s not found; skipped", kBootstrap); return; }
+    s_ran = true;
+
+    char* argv[] = { const_cast<char*>("/bin/sh"), const_cast<char*>(kBootstrap), NULL };
+    int in  = open("/dev/null", O_RDONLY);
+    int out = open(kBootstrapLog, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (in < 0 || out < 0) {
+        alog("HU bootstrap: cannot open /dev/null or %s (errno %d)", kBootstrapLog, errno);
+        if (in >= 0) close(in);
+        if (out >= 0) close(out);
+        return;
+    }
+    alog("HU bootstrap: starting %s (AP+DHCP+mm-renderer, output -> %s)", kBootstrap, kBootstrapLog);
+    time_t t0 = time(NULL);
+#ifdef __QNX__
+    int fdmap[3] = { in, out, out };
+    struct inheritance inh;
+    memset(&inh, 0, sizeof(inh));
+    inh.flags = SPAWN_SETGROUP | SPAWN_SETSIGDEF | SPAWN_SETSIGMASK;   // no SPAWN_NOZOMBIE: we waitpid() below
+    inh.pgroup = SPAWN_NEWPGROUP;
+    sigfillset(&inh.sigdefault);
+    sigemptyset(&inh.sigmask);
+    pid_t pid = spawn("/bin/sh", 3, fdmap, &inh, argv, environ);
+#else
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in, 0);
+    posix_spawn_file_actions_adddup2(&fa, out, 1);
+    posix_spawn_file_actions_adddup2(&fa, out, 2);
+    pid_t pid = -1;
+    if (posix_spawn(&pid, "/bin/sh", &fa, NULL, argv, environ) != 0) pid = -1;
+    posix_spawn_file_actions_destroy(&fa);
+#endif
+    int e = errno;
+    close(in);
+    close(out);
+    if (pid < 0) { alog("HU bootstrap: spawn %s failed (errno %d)", kBootstrap, e); return; }
+
+    // Wait for the script to finish (normal run is a few seconds), but never longer than kBootstrapMaxWaitS.
+    int status = 0;
+    bool done = false;
+    for (int i = 0; i < kBootstrapMaxWaitS * 10; ++i) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) { done = true; break; }
+        if (w < 0) break;                       // no such child / already reaped
+        usleep(100000);                         // 100 ms
+    }
+    long secs = (long)(time(NULL) - t0);
+    if (done && WIFEXITED(status))
+        alog("HU bootstrap: finished after %ld s (pid %d, exit %d)", secs, (int)pid, WEXITSTATUS(status));
+    else if (done)
+        alog("HU bootstrap: finished after %ld s (pid %d, terminated by signal)", secs, (int)pid);
+    else
+        alog("HU bootstrap: pid %d still running after %ld s; continuing (see %s)", (int)pid, secs, kBootstrapLog);
 }
 
 // ---- car gear -> daemon ---------------------------------------------------------------------------------------
@@ -701,6 +801,7 @@ void appOnFinalize(bmw::PluginApp* self) {
 bmw::PluginApp* createApp(bmw::IDispatcher& dispatcher, const char* name, const bmw::Bundle& params, const bmw::Bundle& config) {
     alog("create(name=%s) %s", name ? name : "(null)", NBT_AAD_APP_VERSION);
     if (fileExists(kDisable)) { alog("disabled by %s", kDisable); return NULL; }
+    runHuBootstrap();   // non-CarPlay AP/DHCP/mm-renderer bringup (NBT_HU_BOOTSTRAP), once per process
     if (g_app) { alog("create: already created"); return NULL; }
 
     void* mem = ::operator new(bmw::kPluginAppStorage);
